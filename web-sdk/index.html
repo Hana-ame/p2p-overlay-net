@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hybrid P2P Overlay Network — Browser Peer Demo</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      background: var(--bg);
+      color: var(--text);
+    }
+    h1 { margin: 0 0 8px; font-size: 20px; color: var(--accent); }
+    p.sub { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #0284c7;
+      color: #fff;
+    }
+    .badge.direct { background: var(--green); color: #052e16; }
+    .badge.relay { background: var(--amber); color: #451a03; }
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-right: 8px;
+      margin-top: 8px;
+    }
+    pre {
+      background: #020617;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      font-size: 12px;
+      height: 220px;
+      overflow-y: auto;
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>混合异构 P2P 自治覆盖网络 — Browser Peer 实时验证台</h1>
+  <p class="sub">
+    WebRTC DataChannel (<code>ordered: false, maxRetransmits: 0</code>) + Web Worker KCP ARQ + 20-Byte Overlay Header + 0-RTT 中继转直连热切换
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <div>
+        <strong>节点 A (Browser Peer A)</strong>
+        <span id="badgeA" class="badge relay">0-RTT RELAY READY</span>
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:var(--muted);">
+        NodeID: <code id="nodeIdA">initializing...</code>
+      </div>
+      <div>
+        <button id="btnConnect">1. c = await peerA.connect(peerB.nodeId)</button>
+        <button id="btnSendBurst">2. 发送 KCP 分片压测包 (4 KB)</button>
+        <button id="btnSimulatePunch">3. 模拟后台打洞完成 -> 无感热切换直连</button>
+      </div>
+      <pre id="logA"></pre>
+    </div>
+
+    <div class="card">
+      <div>
+        <strong>节点 B (Browser Peer B) &amp; 虚拟中继 D</strong>
+        <span id="badgeB" class="badge">LISTENING</span>
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:var(--muted);">
+        NodeID: <code id="nodeIdB">initializing...</code>
+      </div>
+      <pre id="logB"></pre>
+    </div>
+  </div>
+
+  <script type="module">
+    import { BrowserOverlayPeer } from "./p2p-client.js";
+    import { decodeOverlayPacket, HeaderFlags } from "./kcp-engine.js";
+
+    const logAEl = document.getElementById("logA");
+    const logBEl = document.getElementById("logB");
+    const badgeA = document.getElementById("badgeA");
+
+    const logA = (msg) => { logAEl.textContent += `[${new Date().toLocaleTimeString()}] ${msg}
+`; logAEl.scrollTop = logAEl.scrollHeight; };
+    const logB = (msg) => { logBEl.textContent += `[${new Date().toLocaleTimeString()}] ${msg}
+`; logBEl.scrollTop = logBEl.scrollHeight; };
+
+    // Initialize two Browser Overlay Peers running in separate Web Workers
+    const peerA = new BrowserOverlayPeer({ nodeId: "aaaa000000000001" });
+    const peerB = new BrowserOverlayPeer({
+      nodeId: "bbbb000000000002",
+      onConnection: (conn) => {
+        logB(`Accepted KCP stream from ${conn.remotePeerId}`);
+        conn.onMessage((evt) => {
+          logB(`Recv (${evt.data.byteLength}B, relayed=${evt.relayed}): ${evt.text().slice(0, 64)}`);
+          conn.send(`Echo ACK (${evt.data.byteLength}B received)`);
+        });
+      },
+    });
+
+    await Promise.all([peerA.ready(), peerB.ready()]);
+    document.getElementById("nodeIdA").textContent = peerA.nodeId;
+    document.getElementById("nodeIdB").textContent = peerB.nodeId;
+
+    // Set up an initial Unordered DataChannel via Simulated SuperNode Relay D (aaaa00000000dddd)
+    const relayId = "dddd000000009999";
+    const [dcAtoD, dcDtoA] = await createUnorderedWebRTCPair();
+    const [dcBtoD, dcDtoB] = await createUnorderedWebRTCPair();
+
+    // Stateless 20-byte header relay forwarder inside Relay D
+    dcDtoA.onmessage = (ev) => {
+      const buf = new Uint8Array(ev.data);
+      buf[2] = Math.max(1, buf[2] - 1); // Decrement TTL
+      buf[3] |= HeaderFlags.RELAYED;    // Mark relayed flag
+      const hdr = decodeOverlayPacket(buf);
+      if (hdr.dstNodeId === peerB.nodeId && dcDtoB.readyState === "open") {
+        dcDtoB.send(buf);
+      }
+    };
+    dcDtoB.onmessage = (ev) => {
+      const buf = new Uint8Array(ev.data);
+      buf[2] = Math.max(1, buf[2] - 1);
+      buf[3] |= HeaderFlags.RELAYED;
+      const hdr = decodeOverlayPacket(buf);
+      if (hdr.dstNodeId === peerA.nodeId && dcDtoA.readyState === "open") {
+        dcDtoA.send(buf);
+      }
+    };
+
+    peerA.attachDataChannel(relayId, dcAtoD, true);
+    peerB.attachDataChannel(relayId, dcBtoD, true);
+    logA("Attached to SuperNode Relay D via WebRTC {ordered:false, maxRetransmits:0}");
+    logB("Attached to SuperNode Relay D via WebRTC {ordered:false, maxRetransmits:0}");
+
+    let connAtoB = null;
+
+    document.getElementById("btnConnect").onclick = async () => {
+      // Ultra-simple API: c = await peerA.connect(id)
+      connAtoB = await peerA.connect(peerB.nodeId);
+      connAtoB.onMessage((evt) => {
+        logA(`Reply from B (relayed=${evt.relayed}): ${evt.text()}`);
+      });
+      connAtoB.onStateChange((state) => {
+        badgeA.textContent = state.pathMode === "direct" ? "DIRECT P2P (HOT UPGRADED)" : "0-RTT RELAY";
+        badgeA.className = "badge " + state.pathMode;
+        logA(`Route state updated -> mode=${state.pathMode}`);
+      });
+      connAtoB.send("Hello P2P over 0-RTT KCP!");
+      logA("0-RTT KCP packet sent immediately via Relay D (0ms wait)!");
+    };
+
+    document.getElementById("btnSendBurst").onclick = async () => {
+      if (!connAtoB) connAtoB = await peerA.connect(peerB.nodeId);
+      const bigText = "KCP-FRAGMENT-TEST-".repeat(230); // ~4.1 KB -> 4 KCP segments (1140B MSS)
+      connAtoB.send(bigText);
+      logA(`Queued 4.1 KB payload (auto-segmented into <=1140B KCP frames, <=1200B physical MTU)`);
+    };
+
+    document.getElementById("btnSimulatePunch").onclick = async () => {
+      const [dcDirectA, dcDirectB] = await createUnorderedWebRTCPair();
+      peerA.attachDataChannel(peerB.nodeId, dcDirectA, false);
+      peerB.attachDataChannel(peerA.nodeId, dcDirectB, false);
+      logA("Direct WebRTC DataChannel punched! Subsequent KCP packets hot-switched to Direct P2P.");
+    };
+
+    async function createUnorderedWebRTCPair() {
+      const pc1 = new RTCPeerConnection();
+      const pc2 = new RTCPeerConnection();
+      pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+      pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+
+      const dc1 = pc1.createDataChannel("overlay-udp", { ordered: false, maxRetransmits: 0 });
+      const dc2Promise = new Promise((res) => { pc2.ondatachannel = (e) => res(e.channel); });
+
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(offer);
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      await pc1.setRemoteDescription(answer);
+
+      const dc2 = await dc2Promise;
+      await Promise.all([
+        dc1.readyState === "open" ? Promise.resolve() : new Promise((r) => (dc1.onopen = r)),
+        dc2.readyState === "open" ? Promise.resolve() : new Promise((r) => (dc2.onopen = r)),
+      ]);
+      return [dc1, dc2];
+    }
+  </script>
+</body>
+</html>

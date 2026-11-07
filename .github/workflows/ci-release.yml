@@ -1,0 +1,142 @@
+name: CI & Multi-Platform Release
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-lint:
+    name: Go Unit Tests & JS Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Go Protocol Stack (Header, Sans-IO KCP, E2EE, RateLimiter, Router)
+        run: |
+          go vet ./pkg/... ./cmd/...
+          go test -v -race -coverprofile=coverage.txt ./pkg/overlay/...
+
+      - name: Verify Browser SDK & Web Worker Syntax
+        run: |
+          node --check web-sdk/kcp-engine.js
+          node --check web-sdk/p2p-worker.js
+          node --check web-sdk/p2p-client.js
+          node web-sdk/test-kcp-node.js
+
+  build-matrix:
+    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: test-and-lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Cross-Compile Lighthouse & Native Peer
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist/${{ matrix.goos }}-${{ matrix.goarch }}
+          go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.goos }}-${{ matrix.goarch }}/lighthouse${{ matrix.ext }} ./cmd/lighthouse
+          go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.goos }}-${{ matrix.goarch }}/native-peer${{ matrix.ext }} ./cmd/native-peer
+
+      - name: Upload Platform Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/
+
+  build-wasm-and-web:
+    name: Build Go Wasm Core & Browser SDK Bundle
+    needs: test-and-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Compile Go Sans-IO Overlay Core to Wasm
+        run: |
+          mkdir -p web-sdk/wasm
+          GOOS=js GOARCH=wasm go build -trimpath -ldflags="-s -w" -o web-sdk/wasm/overlay.wasm ./cmd/wasm-core
+          cp "$(go env GOROOT)/misc/wasm/wasm_exec.js" web-sdk/wasm/ || true
+
+      - name: Upload Web SDK Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-sdk-bundle
+          path: web-sdk/
+
+  package-release:
+    name: Package Release Bundle
+    needs: [build-matrix, build-wasm-and-web]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download All Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+
+      - name: Create Unified Release Zip
+        run: |
+          zip -r p2p-overlay-net-release.zip release-assets/ docs/ README.md
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: p2p-overlay-net-release.zip
+          generate_release_notes: true
