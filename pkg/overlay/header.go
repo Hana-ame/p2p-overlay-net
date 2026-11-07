@@ -91,7 +91,7 @@ type CryptoIdentity struct {
 
 // GenerateIdentity creates a new Ed25519 keypair and derives its 64-bit Crypto-ID.
 func GenerateIdentity() (*CryptoIdentity, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
